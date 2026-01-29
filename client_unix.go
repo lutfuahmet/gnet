@@ -18,9 +18,11 @@ package gnet
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sync/errgroup"
@@ -181,6 +183,21 @@ func (cli *Client) Dial(network, address string) (Conn, error) {
 	return cli.DialContext(network, address, nil)
 }
 
+// DialTLS is like Dial but uses the provided TLS config for the connection.
+// This overrides the client's TLSConfig for this specific connection.
+func (cli *Client) DialTLS(network, address string, tlsConfig *tls.Config) (Conn, error) {
+	return cli.DialTLSContext(network, address, nil, tlsConfig)
+}
+
+// DialTLSContext is like DialTLS but also accepts an empty interface ctx.
+func (cli *Client) DialTLSContext(network, address string, ctx any, tlsConfig *tls.Config) (Conn, error) {
+	c, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	return cli.enrollWithTLS(c, ctx, tlsConfig, extractHostFromAddr(address))
+}
+
 // DialContext is like Dial but also accepts an empty interface ctx that can be obtained later via Conn.Context.
 func (cli *Client) DialContext(network, address string, ctx any) (Conn, error) {
 	c, err := net.Dial(network, address)
@@ -232,19 +249,23 @@ func (cli *Client) EnrollContext(c net.Conn, ctx any) (Conn, error) {
 
 	el := cli.eng.eventLoops.next(nil)
 	var (
-		sockAddr unix.Sockaddr
-		gc       *conn
+		sockAddr   unix.Sockaddr
+		gc         *conn
+		network    string
+		serverName string
 	)
 	switch c.(type) {
 	case *net.UnixConn:
+		network = "unix"
 		sockAddr, _, _, err = socket.GetUnixSockAddr(c.RemoteAddr().Network(), c.RemoteAddr().String())
 		if err != nil {
 			return nil, err
 		}
 		ua := c.LocalAddr().(*net.UnixAddr)
 		ua.Name = c.RemoteAddr().String() + "." + strconv.Itoa(dupFD)
-		gc = newStreamConn("unix", dupFD, el, sockAddr, c.LocalAddr(), c.RemoteAddr())
+		gc = newStreamConn(network, dupFD, el, sockAddr, c.LocalAddr(), c.RemoteAddr())
 	case *net.TCPConn:
+		network = "tcp"
 		if cli.opts.TCPNoDelay == TCPNoDelay {
 			if err = socket.SetNoDelay(dupFD, 1); err != nil {
 				return nil, err
@@ -264,8 +285,13 @@ func (cli *Client) EnrollContext(c net.Conn, ctx any) (Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		gc = newStreamConn("tcp", dupFD, el, sockAddr, c.LocalAddr(), c.RemoteAddr())
+		gc = newStreamConn(network, dupFD, el, sockAddr, c.LocalAddr(), c.RemoteAddr())
+		// Extract server name from remote address for TLS
+		if addr := c.RemoteAddr().String(); addr != "" {
+			serverName = extractHostFromAddr(addr)
+		}
 	case *net.UDPConn:
+		network = "udp"
 		sockAddr, _, _, _, err = socket.GetUDPSockAddr(c.RemoteAddr().Network(), c.RemoteAddr().String())
 		if err != nil {
 			return nil, err
@@ -275,6 +301,147 @@ func (cli *Client) EnrollContext(c net.Conn, ctx any) (Conn, error) {
 		return nil, errorx.ErrUnsupportedProtocol
 	}
 	gc.ctx = ctx
+
+	// Handle TLS if configured (only for stream protocols)
+	if cli.opts.TLSConfig != nil && network != "udp" {
+		gc.tlsState = TLSStateHandshaking
+		timeout := getTLSHandshakeTimeout(cli.opts)
+		tlsConn, err := performClientTLSHandshake(dupFD, cli.opts.TLSConfig, serverName, gc.localAddr, gc.remoteAddr, timeout)
+		if err != nil {
+			_ = unix.Close(dupFD)
+			gc.release()
+			return nil, err
+		}
+		// Create the non-blocking TLS state for post-handshake I/O
+		gc.tlsNB = newTLSNonBlockingState(tlsConn, gc.localAddr, gc.remoteAddr)
+		gc.tlsConn = tlsConn // Keep reference for ConnectionState access
+		gc.tlsState = TLSStateComplete
+	}
+
+	connOpened := make(chan struct{})
+	ccb := &connWithCallback{c: gc, cb: func() {
+		close(connOpened)
+	}}
+	err = el.poller.Trigger(queue.HighPriority, el.register, ccb)
+	if err != nil {
+		gc.Close() //nolint:errcheck
+		return nil, err
+	}
+	<-connOpened
+
+	return gc, nil
+}
+
+// extractHostFromAddr extracts the hostname from an address string (host:port format).
+func extractHostFromAddr(addr string) string {
+	// Handle IPv6 addresses like [::1]:8080
+	if strings.HasPrefix(addr, "[") {
+		if idx := strings.LastIndex(addr, "]:"); idx != -1 {
+			return addr[1:idx]
+		}
+		return strings.TrimPrefix(strings.TrimSuffix(addr, "]"), "[")
+	}
+	// Handle regular addresses like localhost:8080
+	if idx := strings.LastIndex(addr, ":"); idx != -1 {
+		return addr[:idx]
+	}
+	return addr
+}
+
+// enrollWithTLS enrolls a connection with explicit TLS configuration.
+func (cli *Client) enrollWithTLS(c net.Conn, ctx any, tlsConfig *tls.Config, serverName string) (Conn, error) {
+	defer c.Close() //nolint:errcheck
+
+	sc, ok := c.(syscall.Conn)
+	if !ok {
+		return nil, errors.New("failed to convert net.Conn to syscall.Conn")
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return nil, errors.New("failed to get syscall.RawConn from net.Conn")
+	}
+
+	var dupFD int
+	e := rc.Control(func(fd uintptr) {
+		dupFD, err = socket.Dup(int(fd))
+	})
+	if err != nil {
+		return nil, err
+	}
+	if e != nil {
+		return nil, e
+	}
+
+	if cli.opts.SocketSendBuffer > 0 {
+		if err = socket.SetSendBuffer(dupFD, cli.opts.SocketSendBuffer); err != nil {
+			return nil, err
+		}
+	}
+	if cli.opts.SocketRecvBuffer > 0 {
+		if err = socket.SetRecvBuffer(dupFD, cli.opts.SocketRecvBuffer); err != nil {
+			return nil, err
+		}
+	}
+
+	el := cli.eng.eventLoops.next(nil)
+	var (
+		sockAddr unix.Sockaddr
+		gc       *conn
+		network  string
+	)
+	switch c.(type) {
+	case *net.UnixConn:
+		network = "unix"
+		sockAddr, _, _, err = socket.GetUnixSockAddr(c.RemoteAddr().Network(), c.RemoteAddr().String())
+		if err != nil {
+			return nil, err
+		}
+		ua := c.LocalAddr().(*net.UnixAddr)
+		ua.Name = c.RemoteAddr().String() + "." + strconv.Itoa(dupFD)
+		gc = newStreamConn(network, dupFD, el, sockAddr, c.LocalAddr(), c.RemoteAddr())
+	case *net.TCPConn:
+		network = "tcp"
+		if cli.opts.TCPNoDelay == TCPNoDelay {
+			if err = socket.SetNoDelay(dupFD, 1); err != nil {
+				return nil, err
+			}
+		}
+		if cli.opts.TCPKeepAlive > 0 {
+			if err = setKeepAlive(
+				dupFD,
+				true,
+				cli.opts.TCPKeepAlive,
+				cli.opts.TCPKeepInterval,
+				cli.opts.TCPKeepCount); err != nil {
+				return nil, err
+			}
+		}
+		sockAddr, _, _, _, err = socket.GetTCPSockAddr(c.RemoteAddr().Network(), c.RemoteAddr().String())
+		if err != nil {
+			return nil, err
+		}
+		gc = newStreamConn(network, dupFD, el, sockAddr, c.LocalAddr(), c.RemoteAddr())
+	case *net.UDPConn:
+		_ = unix.Close(dupFD)
+		return nil, errors.New("TLS is not supported for UDP connections")
+	default:
+		return nil, errorx.ErrUnsupportedProtocol
+	}
+	gc.ctx = ctx
+
+	// Perform TLS handshake
+	gc.tlsState = TLSStateHandshaking
+	timeout := getTLSHandshakeTimeout(cli.opts)
+	tlsConn, err := performClientTLSHandshake(dupFD, tlsConfig, serverName, gc.localAddr, gc.remoteAddr, timeout)
+	if err != nil {
+		_ = unix.Close(dupFD)
+		gc.release()
+		return nil, err
+	}
+	// Create the non-blocking TLS state for post-handshake I/O
+	gc.tlsNB = newTLSNonBlockingState(tlsConn, gc.localAddr, gc.remoteAddr)
+	gc.tlsConn = tlsConn // Keep reference for ConnectionState access
+	gc.tlsState = TLSStateComplete
 
 	connOpened := make(chan struct{})
 	ccb := &connWithCallback{c: gc, cb: func() {

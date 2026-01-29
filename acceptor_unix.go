@@ -23,6 +23,7 @@ import (
 
 	"github.com/panjf2000/gnet/v2/pkg/errors"
 	"github.com/panjf2000/gnet/v2/pkg/netpoll"
+	"github.com/panjf2000/gnet/v2/pkg/pool/goroutine"
 	"github.com/panjf2000/gnet/v2/pkg/queue"
 	"github.com/panjf2000/gnet/v2/pkg/socket"
 )
@@ -46,7 +47,8 @@ func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error
 
 		remoteAddr := socket.SockaddrToTCPOrUnixAddr(sa)
 		network := el.listeners[fd].network
-		if opts := el.engine.opts; opts.TCPKeepAlive > 0 && network == "tcp" &&
+		opts := el.engine.opts
+		if opts.TCPKeepAlive > 0 && network == "tcp" &&
 			(runtime.GOOS != "linux" && runtime.GOOS != "freebsd" && runtime.GOOS != "dragonfly") {
 			// TCP keepalive options are not inherited from the listening socket
 			// on platforms other than Linux, FreeBSD, or DragonFlyBSD.
@@ -63,14 +65,60 @@ func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error
 			}
 		}
 
-		el := el.engine.eventLoops.next(remoteAddr)
-		c := newStreamConn(network, nfd, el, sa, el.listeners[fd].addr, remoteAddr)
-		err = el.poller.Trigger(queue.HighPriority, el.register, c)
-		if err != nil {
-			el.getLogger().Errorf("failed to enqueue the accepted socket fd=%d to poller: %v", c.fd, err)
-			_ = unix.Close(nfd)
-			c.release()
+		targetEl := el.engine.eventLoops.next(remoteAddr)
+		localAddr := el.listeners[fd].addr
+		c := newStreamConn(network, nfd, targetEl, sa, localAddr, remoteAddr)
+
+		// Handle TLS if configured
+		if opts.TLSConfig != nil && network != "udp" {
+			c.tlsState = TLSStateHandshaking
+			// Offload TLS handshake to goroutine pool to avoid blocking the event loop
+			err = goroutine.DefaultWorkerPool.Submit(func() {
+				el.performTLSHandshakeAndRegister(c, opts, targetEl)
+			})
+			if err != nil {
+				el.getLogger().Errorf("failed to submit TLS handshake job for fd=%d: %v", c.fd, err)
+				_ = unix.Close(nfd)
+				c.release()
+			}
+		} else {
+			err = targetEl.poller.Trigger(queue.HighPriority, targetEl.register, c)
+			if err != nil {
+				el.getLogger().Errorf("failed to enqueue the accepted socket fd=%d to poller: %v", c.fd, err)
+				_ = unix.Close(nfd)
+				c.release()
+			}
 		}
+	}
+}
+
+// performTLSHandshakeAndRegister performs TLS handshake in a goroutine and registers
+// the connection to the event loop upon successful completion.
+func (el *eventloop) performTLSHandshakeAndRegister(c *conn, opts *Options, targetEl *eventloop) {
+	timeout := getTLSHandshakeTimeout(opts)
+	tlsConn, err := performServerTLSHandshake(c.fd, opts.TLSConfig, c.localAddr, c.remoteAddr, timeout)
+	if err != nil {
+		el.getLogger().Errorf("TLS handshake failed for fd=%d: %v", c.fd, err)
+		c.tlsState = TLSStateFailed
+		_ = unix.Close(c.fd)
+		c.release()
+		return
+	}
+
+	// Create the non-blocking TLS state for post-handshake I/O
+	c.tlsNB = newTLSNonBlockingState(tlsConn, c.localAddr, c.remoteAddr)
+	c.tlsConn = tlsConn // Keep reference for ConnectionState access
+	c.tlsState = TLSStateComplete
+
+	// Register the connection to the event loop
+	err = targetEl.poller.Trigger(queue.HighPriority, targetEl.register, c)
+	if err != nil {
+		el.getLogger().Errorf("failed to enqueue TLS connection fd=%d to poller: %v", c.fd, err)
+		c.tlsNB.release()
+		c.tlsNB = nil
+		_ = tlsConn.Close()
+		_ = unix.Close(c.fd)
+		c.release()
 	}
 }
 
@@ -94,7 +142,8 @@ func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) e
 	}
 
 	remoteAddr := socket.SockaddrToTCPOrUnixAddr(sa)
-	if opts := el.engine.opts; opts.TCPKeepAlive > 0 && el.listeners[fd].network == "tcp" &&
+	opts := el.engine.opts
+	if opts.TCPKeepAlive > 0 && network == "tcp" &&
 		(runtime.GOOS != "linux" && runtime.GOOS != "freebsd" && runtime.GOOS != "dragonfly") {
 		// TCP keepalive options are not inherited from the listening socket
 		// on platforms other than Linux, FreeBSD, or DragonFlyBSD.
@@ -112,5 +161,22 @@ func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) e
 	}
 
 	c := newStreamConn(network, nfd, el, sa, el.listeners[fd].addr, remoteAddr)
+
+	// Handle TLS if configured
+	if opts.TLSConfig != nil && network != "udp" {
+		c.tlsState = TLSStateHandshaking
+		// Offload TLS handshake to goroutine pool to avoid blocking the event loop
+		err = goroutine.DefaultWorkerPool.Submit(func() {
+			el.performTLSHandshakeAndRegister(c, opts, el)
+		})
+		if err != nil {
+			el.getLogger().Errorf("failed to submit TLS handshake job for fd=%d: %v", c.fd, err)
+			_ = unix.Close(nfd)
+			c.release()
+			return nil
+		}
+		return nil
+	}
+
 	return el.register0(c)
 }

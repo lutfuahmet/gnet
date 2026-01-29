@@ -17,6 +17,7 @@
 package gnet
 
 import (
+	"crypto/tls"
 	"io"
 	"net"
 	"os"
@@ -52,6 +53,9 @@ type conn struct {
 	isDatagram     bool                   // UDP protocol
 	opened         bool                   // connection opened event fired
 	isEOF          bool                   // whether the connection has reached EOF
+	tlsConn        *tls.Conn              // TLS connection wrapper (nil if not using TLS, used during handshake)
+	tlsNB          *tlsNonBlockingState   // non-blocking TLS state (nil if not using TLS)
+	tlsState       TLSState               // current TLS state
 }
 
 func newStreamConn(proto string, fd int, el *eventloop, sa unix.Sockaddr, localAddr, remoteAddr net.Addr) (c *conn) {
@@ -106,6 +110,16 @@ func (c *conn) release() {
 	}
 	c.localAddr = nil
 	c.remoteAddr = nil
+	// Release TLS resources if present
+	if c.tlsNB != nil {
+		c.tlsNB.release()
+		c.tlsNB = nil
+	}
+	if c.tlsConn != nil {
+		_ = c.tlsConn.Close()
+		c.tlsConn = nil
+	}
+	c.tlsState = TLSStateNone
 	if !c.isDatagram {
 		c.remote = nil
 		c.inboundBuffer.Done()
@@ -137,6 +151,11 @@ func (c *conn) open(buf []byte) error {
 }
 
 func (c *conn) write(data []byte) (n int, err error) {
+	// Route through non-blocking TLS if enabled
+	if c.tlsNB != nil && c.tlsState == TLSStateComplete {
+		return c.writeTLSNonBlocking(data)
+	}
+
 	isET := c.loop.engine.opts.EdgeTriggeredIO
 	n = len(data)
 	// If there is pending data in outbound buffer,
@@ -175,6 +194,73 @@ loop:
 	// Failed to send all data back to the remote, buffer the leftover data for the next round.
 	if len(data) > 0 {
 		_, _ = c.outboundBuffer.Write(data)
+		err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+	}
+
+	return
+}
+
+// writeTLSNonBlocking writes data through the non-blocking TLS connection.
+// It encrypts the data and buffers it for sending to the socket.
+func (c *conn) writeTLSNonBlocking(data []byte) (n int, err error) {
+	n = len(data)
+	// If there is pending data in outbound buffer,
+	// the current data ought to be appended to the
+	// outbound buffer for maintaining the sequence
+	// of network packets.
+	if !c.outboundBuffer.IsEmpty() {
+		_, _ = c.outboundBuffer.Write(data)
+		return
+	}
+
+	defer func() {
+		if err != nil {
+			_ = c.loop.close(c, os.NewSyscallError("write", err))
+		}
+	}()
+
+	isET := c.loop.engine.opts.EdgeTriggeredIO
+
+	// Encrypt data through tls.Conn (writes to bufferConn's writeBuf)
+	_, err = c.tlsNB.tlsConn.Write(data)
+	if err != nil {
+		return 0, err
+	}
+
+	// Get the encrypted data from the buffer
+	encrypted := c.tlsNB.bufConn.getEncryptedOutput()
+	if len(encrypted) == 0 {
+		return
+	}
+
+	// Try to send encrypted data to the socket
+	var sent int
+loop:
+	sent, err = unix.Write(c.fd, encrypted)
+	if err != nil {
+		if err == unix.EAGAIN {
+			// Buffer remaining encrypted data for later
+			_, _ = c.outboundBuffer.Write(encrypted)
+			c.tlsNB.bufConn.discardEncryptedOutput(len(encrypted))
+			if !isET {
+				err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+			}
+			return n, err
+		}
+		return 0, err
+	}
+
+	c.tlsNB.bufConn.discardEncryptedOutput(sent)
+	encrypted = encrypted[sent:]
+
+	if isET && len(encrypted) > 0 {
+		goto loop
+	}
+
+	// Buffer any remaining encrypted data
+	if len(encrypted) > 0 {
+		_, _ = c.outboundBuffer.Write(encrypted)
+		c.tlsNB.bufConn.discardEncryptedOutput(len(encrypted))
 		err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
 	}
 
@@ -558,4 +644,26 @@ func (*conn) SetReadDeadline(_ time.Time) error {
 
 func (*conn) SetWriteDeadline(_ time.Time) error {
 	return errorx.ErrUnsupportedOp
+}
+
+// TLSState returns the current TLS state of the connection.
+func (c *conn) TLSState() TLSState { return c.tlsState }
+
+// TLSConnectionState returns the TLS connection state.
+// Returns nil if TLS is not enabled or handshake is not complete.
+func (c *conn) TLSConnectionState() *tls.ConnectionState {
+	if c.tlsState != TLSStateComplete {
+		return nil
+	}
+	// Check non-blocking TLS state first
+	if c.tlsNB != nil && c.tlsNB.tlsConn != nil {
+		state := c.tlsNB.tlsConn.ConnectionState()
+		return &state
+	}
+	// Fall back to direct tlsConn (during handshake transition)
+	if c.tlsConn != nil {
+		state := c.tlsConn.ConnectionState()
+		return &state
+	}
+	return nil
 }

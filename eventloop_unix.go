@@ -256,6 +256,11 @@ func (el *eventloop) read(c *conn) error {
 		return nil
 	}
 
+	// Route through non-blocking TLS if enabled
+	if c.tlsNB != nil && c.tlsState == TLSStateComplete {
+		return el.readTLSNonBlocking(c)
+	}
+
 	var recv int
 	isET := el.engine.opts.EdgeTriggeredIO
 	chunk := el.engine.opts.EdgeTriggeredIOChunk
@@ -292,6 +297,93 @@ loop:
 	// we need to set up threshold for the maximum read bytes per connection
 	// on each event-loop. If the threshold is reached and there are still
 	// unread data in the socket buffer, we must issue another read event manually.
+	if isET && n == len(el.buffer) {
+		return el.poller.Trigger(queue.LowPriority, el.read0, c)
+	}
+
+	return nil
+}
+
+// readTLSNonBlocking reads data from a TLS connection using non-blocking I/O.
+// It reads encrypted data from the socket, feeds it to the TLS layer,
+// and processes complete TLS records without blocking.
+func (el *eventloop) readTLSNonBlocking(c *conn) error {
+	var recv int
+	isET := el.engine.opts.EdgeTriggeredIO
+	chunk := el.engine.opts.EdgeTriggeredIOChunk
+
+loop:
+	// Step 1: Read encrypted data from the socket (non-blocking)
+	n, err := unix.Read(c.fd, el.buffer)
+	if err != nil {
+		if err == unix.EAGAIN {
+			// No more data available from socket, try to decrypt what we have
+			goto decrypt
+		}
+		return el.close(c, os.NewSyscallError("read", err))
+	}
+	if n == 0 {
+		return el.close(c, io.EOF)
+	}
+	recv += n
+
+	// Step 2: Feed encrypted data to the TLS layer's buffer
+	_, _ = c.tlsNB.bufConn.feedEncryptedData(el.buffer[:n])
+
+decrypt:
+	// Step 3: Try to decrypt complete TLS records
+	for c.tlsNB.bufConn.hasEncryptedData() {
+		// Check if we have a complete TLS record
+		recordSize := checkCompleteRecord(&c.tlsNB.bufConn.readBuf)
+		if recordSize == 0 {
+			// Need more data
+			break
+		}
+		if recordSize < 0 {
+			// Invalid record
+			return el.close(c, errors.New("invalid TLS record"))
+		}
+
+		// Read decrypted data through tls.Conn
+		decrypted := make([]byte, el.engine.opts.ReadBufferCap)
+		dn, err := c.tlsNB.tlsConn.Read(decrypted)
+		if err != nil {
+			if err == io.EOF {
+				return el.close(c, err)
+			}
+			// Check for EAGAIN (need more data)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				break
+			}
+			// syscall.EAGAIN means the buffer didn't have enough data
+			if errors.Is(err, syscall.EAGAIN) {
+				break
+			}
+			return el.close(c, os.NewSyscallError("tls_read", err))
+		}
+
+		if dn > 0 {
+			// Deliver decrypted data to application
+			c.buffer = decrypted[:dn]
+			action := el.eventHandler.OnTraffic(c)
+			switch action {
+			case None:
+			case Close:
+				return el.close(c, nil)
+			case Shutdown:
+				return errorx.ErrEngineShutdown
+			}
+			_, _ = c.inboundBuffer.Write(c.buffer)
+			c.buffer = c.buffer[:0]
+		}
+	}
+
+	// Continue reading if in ET mode and we haven't reached the chunk limit
+	if c.isEOF || (isET && recv < chunk && recv > 0) {
+		goto loop
+	}
+
+	// In ET mode, if we read a full buffer, there might be more data
 	if isET && n == len(el.buffer) {
 		return el.poller.Trigger(queue.LowPriority, el.read0, c)
 	}

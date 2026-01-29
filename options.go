@@ -15,6 +15,7 @@
 package gnet
 
 import (
+	"crypto/tls"
 	"time"
 
 	"github.com/panjf2000/gnet/v2/pkg/logging"
@@ -157,6 +158,18 @@ type Options struct {
 	// 1MB is used. The value of EdgeTriggeredIOChunk must be a power of 2,
 	// otherwise, it will be rounded up to the nearest power of 2.
 	EdgeTriggeredIOChunk int
+
+	// TLSConfig specifies the TLS configuration to use for secure connections.
+	// When set, incoming connections will be upgraded to TLS after accepting.
+	// For server mode, this should contain certificate and key.
+	// For client mode, this can be used to configure client certificates or
+	// custom verification.
+	TLSConfig *tls.Config
+
+	// TLSHandshakeTimeout specifies the maximum duration for a TLS handshake.
+	// If the handshake takes longer than this, the connection is closed.
+	// The default is 30 seconds.
+	TLSHandshakeTimeout time.Duration
 }
 
 // WithOptions sets up all options.
@@ -322,5 +335,23 @@ func WithEdgeTriggeredIO(et bool) Option {
 func WithEdgeTriggeredIOChunk(chunk int) Option {
 	return func(opts *Options) {
 		opts.EdgeTriggeredIOChunk = chunk
+	}
+}
+
+// WithTLSConfig sets the TLS configuration for secure connections.
+// For server mode, the config should include certificates via tls.Config.Certificates
+// or tls.Config.GetCertificate.
+// For client mode, this can configure client certificates or custom verification.
+func WithTLSConfig(config *tls.Config) Option {
+	return func(opts *Options) {
+		opts.TLSConfig = config
+	}
+}
+
+// WithTLSHandshakeTimeout sets the maximum duration for a TLS handshake.
+// The default is 30 seconds if not specified.
+func WithTLSHandshakeTimeout(timeout time.Duration) Option {
+	return func(opts *Options) {
+		opts.TLSHandshakeTimeout = timeout
 	}
 }
