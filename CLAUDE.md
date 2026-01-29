@@ -297,6 +297,48 @@ if tc, ok := conn.(gnet.TLSConn); ok {
 3. **Record framing**: Only decrypts when complete TLS records are available
 4. **EAGAIN handling**: Properly handles non-blocking socket operations
 
+## Using This Fork
+
+This fork includes non-blocking TLS support not yet available in the upstream gnet. To use it in your project:
+
+### Add to go.mod
+
+```go
+module your-project
+
+go 1.20
+
+require (
+    github.com/panjf2000/gnet/v2 v2.7.2
+)
+
+replace github.com/panjf2000/gnet/v2 => github.com/lutfuahmet/gnet/v2 v2.7.2
+```
+
+### Or use go get
+
+```bash
+# Get the latest from dev branch
+go get github.com/lutfuahmet/gnet/v2@dev
+
+# Then add replace directive
+```
+
+### Import in your code
+
+```go
+import "github.com/panjf2000/gnet/v2"
+
+// The replace directive ensures it uses the fork
+```
+
+### Update to latest
+
+```bash
+go get github.com/lutfuahmet/gnet/v2@dev
+go mod tidy
+```
+
 ## Dependencies
 
 | Package | Purpose |
