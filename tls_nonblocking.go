@@ -18,6 +18,7 @@ package gnet
 
 import (
 	"crypto/tls"
+	"errors"
 	"net"
 	"sync"
 	"syscall"
@@ -29,27 +30,116 @@ import (
 // tlsNonBlockingState manages non-blocking TLS I/O for a connection.
 // It wraps a tls.Conn with in-memory buffers to enable non-blocking operations.
 type tlsNonBlockingState struct {
-	tlsConn *tls.Conn   // the underlying TLS connection
+	tlsConn *tls.Conn   // the underlying TLS connection (wraps bufConn)
 	bufConn *bufferConn // buffer-backed net.Conn for tls.Conn
 
-	// decryptedIn holds decrypted plaintext data ready for the application.
-	// This is populated when we successfully decrypt TLS records.
-	decryptedIn elastic.RingBuffer
+	// handshakeComplete indicates whether TLS handshake has finished
+	handshakeComplete bool
 }
 
-// newTLSNonBlockingState creates a new non-blocking TLS state from an established tls.Conn.
-// The tls.Conn should have already completed its handshake.
-func newTLSNonBlockingState(tlsConn *tls.Conn, localAddr, remoteAddr net.Addr) *tlsNonBlockingState {
+// newTLSNonBlockingStateForHandshake creates a new non-blocking TLS state for server-side handshake.
+// The tlsConn wraps bufConn, so all I/O goes through buffers, not the raw fd.
+func newTLSNonBlockingStateForHandshake(config *tls.Config, localAddr, remoteAddr net.Addr) *tlsNonBlockingState {
+	bufConn := newBufferConn(localAddr, remoteAddr)
+	tlsConn := tls.Server(bufConn, config)
+
+	return &tlsNonBlockingState{
+		tlsConn:           tlsConn,
+		bufConn:           bufConn,
+		handshakeComplete: false,
+	}
+}
+
+// newTLSNonBlockingStateForClientHandshake creates a new non-blocking TLS state for client-side handshake.
+func newTLSNonBlockingStateForClientHandshake(config *tls.Config, serverName string, localAddr, remoteAddr net.Addr) *tlsNonBlockingState {
 	bufConn := newBufferConn(localAddr, remoteAddr)
 
-	// Create a new tls.Conn wrapper around our buffer-based net.Conn
-	// We need to extract the connection state and create a wrapper
-	state := &tlsNonBlockingState{
-		tlsConn: tlsConn,
-		bufConn: bufConn,
+	// Clone config to set ServerName if needed
+	cfg := config
+	if serverName != "" && config.ServerName == "" {
+		cfg = config.Clone()
+		cfg.ServerName = serverName
 	}
 
-	return state
+	tlsConn := tls.Client(bufConn, cfg)
+
+	return &tlsNonBlockingState{
+		tlsConn:           tlsConn,
+		bufConn:           bufConn,
+		handshakeComplete: false,
+	}
+}
+
+// feedEncryptedData feeds encrypted data from the socket into the TLS layer.
+// Returns the number of bytes written.
+func (s *tlsNonBlockingState) feedEncryptedData(data []byte) (int, error) {
+	return s.bufConn.feedEncryptedData(data)
+}
+
+// getEncryptedOutput returns encrypted data that needs to be written to the socket.
+func (s *tlsNonBlockingState) getEncryptedOutput() []byte {
+	return s.bufConn.getEncryptedOutput()
+}
+
+// discardEncryptedOutput discards encrypted output that has been written to the socket.
+func (s *tlsNonBlockingState) discardEncryptedOutput(n int) {
+	s.bufConn.discardEncryptedOutput(n)
+}
+
+// continueHandshake attempts to continue the TLS handshake.
+// Returns true if handshake is complete, false if more data is needed.
+// Returns error if handshake fails permanently.
+func (s *tlsNonBlockingState) continueHandshake() (complete bool, err error) {
+	if s.handshakeComplete {
+		return true, nil
+	}
+
+	err = s.tlsConn.Handshake()
+	if err != nil {
+		// Check if it's a temporary error (need more data)
+		if errors.Is(err, syscall.EAGAIN) {
+			return false, nil
+		}
+		// Check for net.Error timeout (also means need more data)
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return false, nil
+		}
+		// Permanent error
+		return false, err
+	}
+
+	s.handshakeComplete = true
+	return true, nil
+}
+
+// read reads decrypted data from the TLS connection.
+// Returns syscall.EAGAIN if no data is available.
+func (s *tlsNonBlockingState) read(buf []byte) (int, error) {
+	if !s.handshakeComplete {
+		return 0, errors.New("handshake not complete")
+	}
+
+	n, err := s.tlsConn.Read(buf)
+	if err != nil {
+		// Convert EAGAIN to indicate need more encrypted data
+		if errors.Is(err, syscall.EAGAIN) {
+			return 0, syscall.EAGAIN
+		}
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return 0, syscall.EAGAIN
+		}
+		return n, err
+	}
+	return n, nil
+}
+
+// write encrypts and buffers data for sending.
+// The encrypted data should be retrieved with getEncryptedOutput().
+func (s *tlsNonBlockingState) write(data []byte) (int, error) {
+	if !s.handshakeComplete {
+		return 0, errors.New("handshake not complete")
+	}
+	return s.tlsConn.Write(data)
 }
 
 // release cleans up the TLS non-blocking state resources.
@@ -58,10 +148,31 @@ func (s *tlsNonBlockingState) release() {
 		_ = s.tlsConn.Close()
 		s.tlsConn = nil
 	}
-	s.decryptedIn.Done()
 	if s.bufConn != nil {
 		s.bufConn.close()
 		s.bufConn = nil
+	}
+}
+
+// connectionState returns the TLS connection state.
+func (s *tlsNonBlockingState) connectionState() tls.ConnectionState {
+	if s.tlsConn != nil {
+		return s.tlsConn.ConnectionState()
+	}
+	return tls.ConnectionState{}
+}
+
+// newTLSNonBlockingStateFromConn creates a non-blocking TLS state from an already-handshaked tls.Conn.
+// This is used for client-side connections where blocking handshake is acceptable.
+// Note: The tlsConn must have completed handshake and wraps the original fdConn.
+// For post-handshake non-blocking I/O, we use bufConn but the initial tlsConn still wraps fdConn.
+// This hybrid approach works because we bypass the bufConn and read directly through tlsConn for clients.
+func newTLSNonBlockingStateFromConn(tlsConn *tls.Conn, localAddr, remoteAddr net.Addr) *tlsNonBlockingState {
+	bufConn := newBufferConn(localAddr, remoteAddr)
+	return &tlsNonBlockingState{
+		tlsConn:           tlsConn,
+		bufConn:           bufConn,
+		handshakeComplete: true, // Already completed
 	}
 }
 
@@ -191,44 +302,9 @@ func (c *bufferConn) discardEncryptedOutput(n int) {
 	_, _ = c.writeBuf.Discard(n)
 }
 
-// TLS record constants.
-const (
-	// tlsRecordHeaderSize is 5 bytes: type(1) + version(2) + length(2).
-	tlsRecordHeaderSize = 5
-	// maxTLSRecordSize is the maximum TLS record size (16KB + overhead).
-	maxTLSRecordSize = 16384 + 2048
-)
-
-// checkCompleteRecord checks if the buffer contains a complete TLS record.
-// Returns the total record size (header + payload) if complete, 0 otherwise.
-func checkCompleteRecord(buf *elastic.RingBuffer) int {
-	buffered := buf.Buffered()
-	if buffered < tlsRecordHeaderSize {
-		return 0 // Need at least header
-	}
-
-	// Peek at the header
-	head, tail := buf.Peek(tlsRecordHeaderSize)
-	var header [tlsRecordHeaderSize]byte
-
-	// Copy header bytes (may be split across head and tail)
-	n := copy(header[:], head)
-	if n < tlsRecordHeaderSize && len(tail) > 0 {
-		copy(header[n:], tail)
-	}
-
-	// Parse record length from header bytes 3-4 (big-endian)
-	recordLen := int(header[3])<<8 | int(header[4])
-
-	// Validate record length
-	if recordLen > maxTLSRecordSize {
-		return -1 // Invalid record
-	}
-
-	totalLen := tlsRecordHeaderSize + recordLen
-	if buffered >= totalLen {
-		return totalLen
-	}
-
-	return 0 // Need more data
+// hasEncryptedOutput returns true if there's encrypted data to write to socket.
+func (c *bufferConn) hasEncryptedOutput() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.writeBuf.IsEmpty()
 }

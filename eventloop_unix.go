@@ -225,7 +225,17 @@ func (el *eventloop) register0(c *conn) error {
 	if c.isDatagram && c.remote != nil {
 		return nil
 	}
-	return el.open(c)
+	if err := el.open(c); err != nil {
+		return err
+	}
+
+	// For TLS connections, trigger an initial read since the HTTP request
+	// may have arrived during the TLS handshake and edge-triggered mode
+	// won't notify us about data that's already in the socket buffer.
+	if c.tlsNB != nil && c.tlsState == TLSStateComplete {
+		return el.poller.Trigger(queue.LowPriority, el.read0, c)
+	}
+	return nil
 }
 
 func (el *eventloop) open(c *conn) error {
@@ -305,86 +315,57 @@ loop:
 }
 
 // readTLSNonBlocking reads data from a TLS connection using non-blocking I/O.
-// It reads encrypted data from the socket, feeds it to the TLS layer,
-// and processes complete TLS records without blocking.
+// The tlsConn wraps fdConn which reads directly from the socket fd.
+// We read through tlsConn which handles decryption transparently.
 func (el *eventloop) readTLSNonBlocking(c *conn) error {
 	var recv int
 	isET := el.engine.opts.EdgeTriggeredIO
 	chunk := el.engine.opts.EdgeTriggeredIOChunk
 
 loop:
-	// Step 1: Read encrypted data from the socket (non-blocking)
-	n, err := unix.Read(c.fd, el.buffer)
+	// Read decrypted data directly through tlsConn.
+	// tlsConn wraps fdConn which reads encrypted data from the socket,
+	// decrypts it, and returns plaintext.
+	decrypted := make([]byte, el.engine.opts.ReadBufferCap)
+	n, err := c.tlsNB.tlsConn.Read(decrypted)
 	if err != nil {
-		if err == unix.EAGAIN {
-			// No more data available from socket, try to decrypt what we have
-			goto decrypt
+		if err == io.EOF {
+			return el.close(c, err)
 		}
-		return el.close(c, os.NewSyscallError("read", err))
+		// Check for EAGAIN (no data available - non-blocking)
+		if errors.Is(err, syscall.EAGAIN) {
+			return nil
+		}
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return nil
+		}
+		return el.close(c, os.NewSyscallError("tls_read", err))
 	}
 	if n == 0 {
 		return el.close(c, io.EOF)
 	}
 	recv += n
 
-	// Step 2: Feed encrypted data to the TLS layer's buffer
-	_, _ = c.tlsNB.bufConn.feedEncryptedData(el.buffer[:n])
-
-decrypt:
-	// Step 3: Try to decrypt complete TLS records
-	for c.tlsNB.bufConn.hasEncryptedData() {
-		// Check if we have a complete TLS record
-		recordSize := checkCompleteRecord(&c.tlsNB.bufConn.readBuf)
-		if recordSize == 0 {
-			// Need more data
-			break
-		}
-		if recordSize < 0 {
-			// Invalid record
-			return el.close(c, errors.New("invalid TLS record"))
-		}
-
-		// Read decrypted data through tls.Conn
-		decrypted := make([]byte, el.engine.opts.ReadBufferCap)
-		dn, err := c.tlsNB.tlsConn.Read(decrypted)
-		if err != nil {
-			if err == io.EOF {
-				return el.close(c, err)
-			}
-			// Check for EAGAIN (need more data)
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				break
-			}
-			// syscall.EAGAIN means the buffer didn't have enough data
-			if errors.Is(err, syscall.EAGAIN) {
-				break
-			}
-			return el.close(c, os.NewSyscallError("tls_read", err))
-		}
-
-		if dn > 0 {
-			// Deliver decrypted data to application
-			c.buffer = decrypted[:dn]
-			action := el.eventHandler.OnTraffic(c)
-			switch action {
-			case None:
-			case Close:
-				return el.close(c, nil)
-			case Shutdown:
-				return errorx.ErrEngineShutdown
-			}
-			_, _ = c.inboundBuffer.Write(c.buffer)
-			c.buffer = c.buffer[:0]
-		}
+	// Deliver decrypted data to application
+	c.buffer = decrypted[:n]
+	action := el.eventHandler.OnTraffic(c)
+	switch action {
+	case None:
+	case Close:
+		return el.close(c, nil)
+	case Shutdown:
+		return errorx.ErrEngineShutdown
 	}
+	_, _ = c.inboundBuffer.Write(c.buffer)
+	c.buffer = c.buffer[:0]
 
 	// Continue reading if in ET mode and we haven't reached the chunk limit
-	if c.isEOF || (isET && recv < chunk && recv > 0) {
+	if c.isEOF || (isET && recv < chunk) {
 		goto loop
 	}
 
 	// In ET mode, if we read a full buffer, there might be more data
-	if isET && n == len(el.buffer) {
+	if isET && n == len(decrypted) {
 		return el.poller.Trigger(queue.LowPriority, el.read0, c)
 	}
 

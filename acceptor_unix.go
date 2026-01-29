@@ -74,7 +74,7 @@ func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error
 			c.tlsState = TLSStateHandshaking
 			// Offload TLS handshake to goroutine pool to avoid blocking the event loop
 			err = goroutine.DefaultWorkerPool.Submit(func() {
-				el.performTLSHandshakeAndRegister(c, opts, targetEl)
+				el.setupTLSAndRegister(c, opts, targetEl)
 			})
 			if err != nil {
 				el.getLogger().Errorf("failed to submit TLS handshake job for fd=%d: %v", c.fd, err)
@@ -92,31 +92,20 @@ func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error
 	}
 }
 
-// performTLSHandshakeAndRegister performs TLS handshake in a goroutine and registers
-// the connection to the event loop upon successful completion.
-func (el *eventloop) performTLSHandshakeAndRegister(c *conn, opts *Options, targetEl *eventloop) {
-	timeout := getTLSHandshakeTimeout(opts)
-	tlsConn, err := performServerTLSHandshake(c.fd, opts.TLSConfig, c.localAddr, c.remoteAddr, timeout)
-	if err != nil {
-		el.getLogger().Errorf("TLS handshake failed for fd=%d: %v", c.fd, err)
-		c.tlsState = TLSStateFailed
-		_ = unix.Close(c.fd)
-		c.release()
-		return
-	}
-
-	// Create the non-blocking TLS state for post-handshake I/O
-	c.tlsNB = newTLSNonBlockingState(tlsConn, c.localAddr, c.remoteAddr)
-	c.tlsConn = tlsConn // Keep reference for ConnectionState access
-	c.tlsState = TLSStateComplete
+// setupTLSAndRegister sets up non-blocking TLS state and registers the connection.
+// The TLS handshake will happen incrementally in the event loop as data arrives.
+func (el *eventloop) setupTLSAndRegister(c *conn, opts *Options, targetEl *eventloop) {
+	// Create non-blocking TLS state - handshake will happen incrementally
+	c.tlsNB = newTLSNonBlockingStateForHandshake(opts.TLSConfig, c.localAddr, c.remoteAddr)
+	c.tlsState = TLSStateHandshaking
 
 	// Register the connection to the event loop
-	err = targetEl.poller.Trigger(queue.HighPriority, targetEl.register, c)
+	// The handshake will continue as data arrives
+	err := targetEl.poller.Trigger(queue.HighPriority, targetEl.register, c)
 	if err != nil {
 		el.getLogger().Errorf("failed to enqueue TLS connection fd=%d to poller: %v", c.fd, err)
 		c.tlsNB.release()
 		c.tlsNB = nil
-		_ = tlsConn.Close()
 		_ = unix.Close(c.fd)
 		c.release()
 	}
@@ -167,7 +156,7 @@ func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) e
 		c.tlsState = TLSStateHandshaking
 		// Offload TLS handshake to goroutine pool to avoid blocking the event loop
 		err = goroutine.DefaultWorkerPool.Submit(func() {
-			el.performTLSHandshakeAndRegister(c, opts, el)
+			el.setupTLSAndRegister(c, opts, el)
 		})
 		if err != nil {
 			el.getLogger().Errorf("failed to submit TLS handshake job for fd=%d: %v", c.fd, err)

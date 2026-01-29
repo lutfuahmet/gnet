@@ -313,7 +313,7 @@ func (cli *Client) EnrollContext(c net.Conn, ctx any) (Conn, error) {
 			return nil, err
 		}
 		// Create the non-blocking TLS state for post-handshake I/O
-		gc.tlsNB = newTLSNonBlockingState(tlsConn, gc.localAddr, gc.remoteAddr)
+		gc.tlsNB = newTLSNonBlockingStateFromConn(tlsConn, gc.localAddr, gc.remoteAddr)
 		gc.tlsConn = tlsConn // Keep reference for ConnectionState access
 		gc.tlsState = TLSStateComplete
 	}
@@ -439,7 +439,7 @@ func (cli *Client) enrollWithTLS(c net.Conn, ctx any, tlsConfig *tls.Config, ser
 		return nil, err
 	}
 	// Create the non-blocking TLS state for post-handshake I/O
-	gc.tlsNB = newTLSNonBlockingState(tlsConn, gc.localAddr, gc.remoteAddr)
+	gc.tlsNB = newTLSNonBlockingStateFromConn(tlsConn, gc.localAddr, gc.remoteAddr)
 	gc.tlsConn = tlsConn // Keep reference for ConnectionState access
 	gc.tlsState = TLSStateComplete
 
